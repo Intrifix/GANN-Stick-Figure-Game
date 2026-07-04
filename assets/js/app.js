@@ -1,36 +1,11 @@
 (() => {
 'use strict';
 
-const canvas = document.getElementById('world');
+const {canvas, chart, els} = window.GANN_DOM;
+const cfg = window.GANN_CONFIG;
+const {clamp, lerp, smoothstep, tanh, m, ms} = window.GANN_MATH;
 const ctx = canvas.getContext('2d');
-const chart = document.getElementById('chart');
 const cctx = chart.getContext('2d');
-
-const els = {
-  toggle: document.getElementById('toggle'), reset: document.getElementById('reset'), cold: document.getElementById('cold'), forceRun: document.getElementById('forceRun'),
-  speed: document.getElementById('speed'), speedVal: document.getElementById('speedVal'), mutation: document.getElementById('mutation'), mutVal: document.getElementById('mutVal'),
-  cameraMode: document.getElementById('cameraMode'), generation: document.getElementById('generation'), alive: document.getElementById('alive'),
-  bestDist: document.getElementById('bestDist'), bestSpeed: document.getElementById('bestSpeed'), diversity: document.getElementById('diversity'), escapes: document.getElementById('escapes'), escapeStatus: document.getElementById('escapeStatus'), walkPct: document.getElementById('walkPct'), runPct: document.getElementById('runPct'),
-  walkBar: document.getElementById('walkBar'), runBar: document.getElementById('runBar'), episodeClock: document.getElementById('episodeClock'), stageBadge: document.getElementById('stageBadge'),
-  save: document.getElementById('save'), load: document.getElementById('load')
-};
-
-const cfg = {
-  popSize: 42,
-  eliteCount: 5,
-  inputCount: 49,
-  hiddenCount: 30,
-  outputCount: 14,
-  traitCount: 13,
-  dt: 1 / 60,
-  walkTime: 18,
-  runTime: 13.5,
-  walkTarget: 1.25,
-  runTarget: 2.8,
-  trackWinWalk: 18,
-  trackWinRun: 34,
-  scale: 72
-};
 const brainGenomeLength = (cfg.inputCount + 1) * cfg.hiddenCount + (cfg.hiddenCount + 1) * cfg.outputCount;
 const traitStart = brainGenomeLength;
 const genomeLength = brainGenomeLength + cfg.traitCount;
@@ -78,16 +53,6 @@ function randn(){
   while(v === 0) v = rng();
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
-function clamp(v,lo,hi){return Math.max(lo, Math.min(hi, v));}
-function lerp(a,b,t){return a + (b-a)*t;}
-function smoothstep(edge0, edge1, x){
-  const t = clamp((x - edge0) / Math.max(1e-9, edge1 - edge0), 0, 1);
-  return t * t * (3 - 2 * t);
-}
-const tanh = Math.tanh ? Math.tanh : function tanhFallback(x){ return (Math.exp(2*x)-1)/(Math.exp(2*x)+1); };
-function m(v){return `${v.toFixed(1)} m`;}
-function ms(v){return `${v.toFixed(2)} m/s`;}
-
 class Brain {
   constructor(genome){ this.g = genome; }
   think(input){
@@ -1171,11 +1136,11 @@ function reset(seedMode=false){
 function saveChampion(){
   if(!bestEver) return;
   const packed = {genome:Array.from(bestEver.genome), fitness:bestEver.fitness, x:bestEver.x, avgSpeed:bestEver.avgSpeed, stage, savedAt:new Date().toISOString()};
-  localStorage.setItem('gann-stick-learner-champion-v4', JSON.stringify(packed));
+  localStorage.setItem(cfg.storageKeys[0], JSON.stringify(packed));
   els.save.textContent = 'Saved'; setTimeout(()=>els.save.textContent='Save champion',900);
 }
 function loadChampion(){
-  const txt = localStorage.getItem('gann-stick-learner-champion-v4') || localStorage.getItem('gann-stick-learner-champion-v3') || localStorage.getItem('gann-stick-learner-champion-v2') || localStorage.getItem('gann-stick-learner-champion-v1');
+  const txt = cfg.storageKeys.map(key => localStorage.getItem(key)).find(Boolean);
   if(!txt){ els.load.textContent = 'No save'; setTimeout(()=>els.load.textContent='Load champion',900); return; }
   try{
     const packed = JSON.parse(txt);
