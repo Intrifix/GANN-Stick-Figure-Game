@@ -1,0 +1,1227 @@
+(() => {
+'use strict';
+
+const canvas = document.getElementById('world');
+const ctx = canvas.getContext('2d');
+const chart = document.getElementById('chart');
+const cctx = chart.getContext('2d');
+
+const els = {
+  toggle: document.getElementById('toggle'), reset: document.getElementById('reset'), cold: document.getElementById('cold'), forceRun: document.getElementById('forceRun'),
+  speed: document.getElementById('speed'), speedVal: document.getElementById('speedVal'), mutation: document.getElementById('mutation'), mutVal: document.getElementById('mutVal'),
+  cameraMode: document.getElementById('cameraMode'), generation: document.getElementById('generation'), alive: document.getElementById('alive'),
+  bestDist: document.getElementById('bestDist'), bestSpeed: document.getElementById('bestSpeed'), diversity: document.getElementById('diversity'), escapes: document.getElementById('escapes'), escapeStatus: document.getElementById('escapeStatus'), walkPct: document.getElementById('walkPct'), runPct: document.getElementById('runPct'),
+  walkBar: document.getElementById('walkBar'), runBar: document.getElementById('runBar'), episodeClock: document.getElementById('episodeClock'), stageBadge: document.getElementById('stageBadge'),
+  save: document.getElementById('save'), load: document.getElementById('load')
+};
+
+const cfg = {
+  popSize: 42,
+  eliteCount: 5,
+  inputCount: 49,
+  hiddenCount: 30,
+  outputCount: 14,
+  traitCount: 13,
+  dt: 1 / 60,
+  walkTime: 18,
+  runTime: 13.5,
+  walkTarget: 1.25,
+  runTarget: 2.8,
+  trackWinWalk: 18,
+  trackWinRun: 34,
+  scale: 72
+};
+const brainGenomeLength = (cfg.inputCount + 1) * cfg.hiddenCount + (cfg.hiddenCount + 1) * cfg.outputCount;
+const traitStart = brainGenomeLength;
+const genomeLength = brainGenomeLength + cfg.traitCount;
+
+let seed = (Date.now() ^ 0x9e3779b9) >>> 0;
+let rng = mulberry32(seed);
+let population = [];
+let generation = 1;
+let episodeTime = 0;
+let paused = false;
+let stage = 'walk';
+let bestEver = null;
+let bestThisGen = null;
+let history = [];
+let cameraX = 0;
+let generationJustEvolved = false;
+let won = false;
+let stagnation = makeStagnation();
+
+function makeStagnation(){
+  return {
+    bestProgress: -Infinity,
+    stale: 0,
+    escapes: 0,
+    lastEscapeGen: -999,
+    lastDiversity: 0,
+    lastProgress: 0,
+    lastAction: 'normal',
+    lastReason: ''
+  };
+}
+
+function mulberry32(a){
+  return function(){
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function rand(min=0,max=1){return min + (max-min)*rng();}
+function randn(){
+  let u = 0, v = 0;
+  while(u === 0) u = rng();
+  while(v === 0) v = rng();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+function clamp(v,lo,hi){return Math.max(lo, Math.min(hi, v));}
+function lerp(a,b,t){return a + (b-a)*t;}
+function smoothstep(edge0, edge1, x){
+  const t = clamp((x - edge0) / Math.max(1e-9, edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+const tanh = Math.tanh ? Math.tanh : function tanhFallback(x){ return (Math.exp(2*x)-1)/(Math.exp(2*x)+1); };
+function m(v){return `${v.toFixed(1)} m`;}
+function ms(v){return `${v.toFixed(2)} m/s`;}
+
+class Brain {
+  constructor(genome){ this.g = genome; }
+  think(input){
+    const h = new Float32Array(cfg.hiddenCount);
+    let k = 0;
+    for(let j=0;j<cfg.hiddenCount;j++){
+      let sum = this.g[k++];
+      for(let i=0;i<cfg.inputCount;i++) sum += input[i] * this.g[k++];
+      h[j] = tanh(sum);
+    }
+    const out = new Float32Array(cfg.outputCount);
+    for(let o=0;o<cfg.outputCount;o++){
+      let sum = this.g[k++];
+      for(let j=0;j<cfg.hiddenCount;j++) sum += h[j] * this.g[k++];
+      out[o] = tanh(sum);
+    }
+    return out;
+  }
+}
+
+function traitGene(genome, index){
+  return tanh(Number(genome[traitStart + index] || 0));
+}
+function traitRange(genome, index, center, spread, lo, hi){
+  return clamp(center + traitGene(genome, index) * spread, lo, hi);
+}
+function decodeTraits(genome){
+  return {
+    sweepGain: traitRange(genome, 0, 1.00, 0.38, 0.58, 1.42),
+    speedDamp: traitRange(genome, 1, 0.16, 0.08, 0.07, 0.27),
+    sweepBias: traitRange(genome, 2, 0.00, 0.42, -0.50, 0.50),
+    sweepForce: traitRange(genome, 3, 1.00, 0.32, 0.58, 1.38),
+    behindDrive: traitRange(genome, 4, 0.92, 0.30, 0.52, 1.30),
+    extensionDrive: traitRange(genome, 5, 0.23, 0.14, 0.06, 0.44),
+    ankleDrive: traitRange(genome, 6, 0.12, 0.09, 0.02, 0.25),
+    airDragX: traitRange(genome, 7, 0.085, 0.055, 0.035, 0.165),
+    accelTolerance: traitRange(genome, 8, 14.0, 4.2, 8.5, 19.0),
+    clockInput: traitRange(genome, 9, 0.25, 0.75, 0.0, 1.15),
+    clockRate: traitRange(genome, 10, 1.00, 0.55, 0.35, 1.75),
+    reflexGain: traitRange(genome, 11, 0.55, 0.35, 0.10, 1.05),
+    motorSmoothing: traitRange(genome, 12, 1.00, 0.45, 0.45, 1.55)
+  };
+}
+
+class Agent {
+  constructor(genome, id, parentFitness=0){
+    this.genome = genome;
+    this.brain = new Brain(genome);
+    this.traits = decodeTraits(genome);
+    this.id = id;
+    this.parentFitness = parentFitness;
+    this.reset();
+  }
+  reset(){
+    this.x = rand(-0.035, 0.035); this.y = rand(0.94, 1.12); this.vx = rand(-0.04, 0.04); this.vy = 0;
+    this.angle = rand(-0.16,0.16); this.av = rand(-0.18,0.18);
+    this.clockOffset = rand(0, Math.PI * 2);
+    this.clockWobble = rand(0.82, 1.18);
+    this.age = 0; this.alive = true; this.fallen = false;
+    this.energy = 0; this.airTime = 0; this.groundTime = 0; this.steps = 0;
+    this.accelPenalty = 0; this.jitterPenalty = 0; this.skatePenalty = 0; this.hoverPenalty = 0; this.badThrustPenalty = 0; this.legDominancePenalty = 0;
+    this.airStreak = 0; this.loadedContactTime = 0; this.driveContactTime = 0; this.goodSteps = 0;
+    this.leftGoodSteps = 0; this.rightGoodSteps = 0; this.altGoodSteps = 0; this.sameFootGoodSteps = 0;
+    this.leftTouchCount = 0; this.rightTouchCount = 0; this.leftContactTime = 0; this.rightContactTime = 0;
+    this.singleContactTime = 0; this.doubleContactTime = 0; this.gluedFeetPenalty = 0;
+    this.lastGoodFoot = null; this.bestDualStepMin = 0;
+    this.lPlantX = null; this.rPlantX = null; this.lStanceTime = 0; this.rStanceTime = 0;
+    this.lTouchRel = 0; this.rTouchRel = 0; this.lMaxTravel = 0; this.rMaxTravel = 0;
+    this.maxX = this.x; this.minY = this.y; this.fitness = 0; this.avgSpeed = 0;
+    this.lastContactMask = 0;
+    this.j = {
+      lh: rand(-0.48,0.48), lk: rand(0.08,1.10), la: rand(-0.35,0.35),
+      rh: rand(-0.48,0.48), rk: rand(0.08,1.10), ra: rand(-0.35,0.35),
+      ls: rand(-0.75,0.75), rs: rand(-0.75,0.75), lean: rand(-0.20,0.20), muscle: rand(0.12,0.55),
+      lswing: rand(0.05,0.45), rswing: rand(0.05,0.45), lstiff: rand(0.15,0.65), rstiff: rand(0.15,0.65)
+    };
+    this.lastOut = new Float32Array(cfg.outputCount);
+    const f = this.computeFeet();
+    this.prevRelL = f.left.relX; this.prevRelR = f.right.relX;
+    this.prevRelVelL = 0; this.prevRelVelR = 0;
+    this.prevLX = f.left.x; this.prevRX = f.right.x;
+    this.prevVx = this.vx; this.prevVy = this.vy;
+    this.trail = [];
+  }
+  inputVector(targetSpeed){
+    const traits = this.traits;
+    const baseRate = stage === 'run' ? 5.2 : 3.6;
+    const phase = this.age * baseRate * traits.clockRate * this.clockWobble + this.clockOffset;
+    const clockAmp = traits.clockInput;
+    const feet = this.computeFeet();
+    const lc = feet.left.contact ? 1 : 0;
+    const rc = feet.right.contact ? 1 : 0;
+    const age = Math.max(0.1, this.age);
+    const out = new Float32Array(cfg.inputCount);
+    let k = 0;
+    out[k++] = Math.sin(phase) * clockAmp;
+    out[k++] = Math.cos(phase) * clockAmp;
+    out[k++] = clamp(this.vx / Math.max(0.1,targetSpeed), -2, 2);
+    out[k++] = clamp((targetSpeed - this.vx) / Math.max(0.1,targetSpeed), -2, 2);
+    out[k++] = clamp(this.angle, -1.5, 1.5);
+    out[k++] = clamp(this.av, -3, 3);
+    out[k++] = clamp((this.y - 1.03) * 2, -1, 1);
+    out[k++] = lc; out[k++] = rc;
+    out[k++] = clamp(feet.left.relX, -1, 1);
+    out[k++] = clamp(feet.right.relX, -1, 1);
+    out[k++] = clamp(this.j.lh, -1.5, 1.5);
+    out[k++] = clamp(this.j.rh, -1.5, 1.5);
+    out[k++] = clamp(this.j.lk - 0.45, -1, 1);
+    out[k++] = clamp(this.j.rk - 0.45, -1, 1);
+    out[k++] = clamp(this.energy / 500, 0, 2);
+    out[k++] = stage === 'run' ? 1 : -1;
+    out[k++] = 1;
+    // Extra leg-state intelligence: foot height, foot sweep velocity, stance
+    // timers, contact history, step history, vertical motion, ankles and muscle.
+    out[k++] = clamp(feet.left.y * 3, -1, 1);
+    out[k++] = clamp(feet.right.y * 3, -1, 1);
+    out[k++] = clamp(this.prevRelVelL / 4, -2, 2);
+    out[k++] = clamp(this.prevRelVelR / 4, -2, 2);
+    out[k++] = clamp(this.lStanceTime * 2.2, 0, 2);
+    out[k++] = clamp(this.rStanceTime * 2.2, 0, 2);
+    out[k++] = clamp(this.leftContactTime / age, 0, 1.5);
+    out[k++] = clamp(this.rightContactTime / age, 0, 1.5);
+    out[k++] = clamp(this.leftTouchCount / 10, 0, 2);
+    out[k++] = clamp(this.rightTouchCount / 10, 0, 2);
+    out[k++] = clamp(this.leftGoodSteps / 8, 0, 2);
+    out[k++] = clamp(this.rightGoodSteps / 8, 0, 2);
+    out[k++] = clamp(this.altGoodSteps / 8, 0, 2);
+    out[k++] = clamp(this.vy / 4, -2, 2);
+    out[k++] = clamp(this.j.la, -1.5, 1.5);
+    out[k++] = clamp(this.j.ra, -1.5, 1.5);
+    out[k++] = clamp(this.j.muscle, 0, 1.8);
+    // Previous motor command feedback gives the feed-forward network short-term
+    // memory, making multi-step motions much easier to discover.
+    for(let i=0;i<cfg.outputCount;i++) out[k++] = clamp(this.lastOut[i] || 0, -1, 1);
+    return out;
+  }
+  applyOutputs(out, dt, sensedFeet){
+    const smooth = clamp(7.5 * dt * (0.45 + this.j.muscle) * this.traits.motorSmoothing, 0, 1);
+    const feet = sensedFeet || this.computeFeet();
+    const lContact = feet.left.contact ? 1 : 0;
+    const rContact = feet.right.contact ? 1 : 0;
+    const lSwingCmd = ((out[10] || 0) + 1) * 0.5;
+    const rSwingCmd = ((out[11] || 0) + 1) * 0.5;
+    const lStiffCmd = ((out[12] || 0) + 1) * 0.5;
+    const rStiffCmd = ((out[13] || 0) + 1) * 0.5;
+    const reflex = this.traits.reflexGain;
+    const lLateStance = smoothstep(0.24, 0.66, this.lStanceTime);
+    const rLateStance = smoothstep(0.24, 0.66, this.rStanceTime);
+    const lSwingGate = lSwingCmd * (1 - lContact * 0.58 + lLateStance * 0.32) * reflex;
+    const rSwingGate = rSwingCmd * (1 - rContact * 0.58 + rLateStance * 0.32) * reflex;
+    const lStanceGate = lContact * lStiffCmd * reflex;
+    const rStanceGate = rContact * rStiffCmd * reflex;
+    const target = {
+      lh: out[0] * 0.92 + lSwingGate * 0.26 - lStanceGate * 0.10,
+      lk: 0.04 + ((out[1] + 1) * 0.5) * 1.28 + lSwingGate * 0.38 - lStanceGate * 0.18,
+      la: out[2] * 0.48 + lSwingGate * 0.10 - lStanceGate * 0.05,
+      rh: out[3] * 0.92 + rSwingGate * 0.26 - rStanceGate * 0.10,
+      rk: 0.04 + ((out[4] + 1) * 0.5) * 1.28 + rSwingGate * 0.38 - rStanceGate * 0.18,
+      ra: out[5] * 0.48 + rSwingGate * 0.10 - rStanceGate * 0.05,
+      ls: out[6] * 1.15,
+      rs: out[7] * 1.15,
+      lean: out[8] * (stage === 'run' ? 0.42 : 0.32),
+      muscle: 0.35 + ((out[9] + 1) * 0.5) * 0.9 + (lStiffCmd + rStiffCmd - 1) * 0.10,
+      lswing: lSwingCmd,
+      rswing: rSwingCmd,
+      lstiff: lStiffCmd,
+      rstiff: rStiffCmd
+    };
+    target.lh = clamp(target.lh, -1.05, 1.05);
+    target.rh = clamp(target.rh, -1.05, 1.05);
+    target.lk = clamp(target.lk, 0.03, 1.45);
+    target.rk = clamp(target.rk, 0.03, 1.45);
+    target.la = clamp(target.la, -0.58, 0.58);
+    target.ra = clamp(target.ra, -0.58, 0.58);
+    target.muscle = clamp(target.muscle, 0.18, 1.35);
+    for(const key of ['lh','lk','la','rh','rk','ra','ls','rs','lean','muscle','lswing','rswing','lstiff','rstiff']){
+      const energyWeight = key === 'muscle' ? 0.4 : (key.endsWith('swing') || key.endsWith('stiff') ? 0.22 : 1.0);
+      this.energy += Math.abs(target[key] - this.j[key]) * energyWeight;
+      this.j[key] = lerp(this.j[key], target[key], smooth);
+    }
+    this.lastOut.set(out);
+  }
+  computeFeet(){
+    const thigh = 0.53, shin = 0.53;
+    const bodyInfluence = this.angle * 0.26;
+    function leg(side, hip, knee, ankle, x, y){
+      const hipA = bodyInfluence + hip;
+      const kneeA = hipA - knee * 0.72 + ankle * 0.15;
+      const kx = x + thigh * Math.sin(hipA);
+      const ky = y - thigh * Math.cos(hipA);
+      const fx = kx + shin * Math.sin(kneeA);
+      const fy = ky - shin * Math.cos(kneeA);
+      return {side, kneeX:kx, kneeY:ky, x:fx, y:fy, relX:fx-x, reach:Math.hypot(fx-x, fy-y), contact:fy <= 0.025 && fy > -0.18 && knee < 0.98};
+    }
+    return {
+      left: leg('L', this.j.lh, this.j.lk, this.j.la, this.x, this.y),
+      right: leg('R', this.j.rh, this.j.rk, this.j.ra, this.x, this.y)
+    };
+  }
+  step(dt, targetSpeed){
+    if(!this.alive) return;
+    this.age += dt;
+    const sensedFeet = this.computeFeet();
+    const input = this.inputVector(targetSpeed);
+    const out = this.brain.think(input);
+    this.applyOutputs(out, dt, sensedFeet);
+
+    const feet = this.computeFeet();
+    const traits = this.traits;
+    const contacts = [feet.left, feet.right].filter(f => f.contact);
+    const contactCount = contacts.length;
+    let forceX = 0;
+    let forceY = -9.8;
+    let support = this.x;
+    let stanceMask = 0;
+    const oldVx = this.vx;
+    const oldVy = this.vy;
+
+    if(feet.left.contact) stanceMask |= 1;
+    if(feet.right.contact) stanceMask |= 2;
+    if(contactCount === 1) this.singleContactTime += dt;
+    if(contactCount === 2) this.doubleContactTime += dt;
+    if(stanceMask !== 0 && stanceMask !== this.lastContactMask) this.steps++;
+    this.lastContactMask = stanceMask;
+
+    const releaseFoot = (side) => {
+      const stanceKey = side === 'L' ? 'lStanceTime' : 'rStanceTime';
+      const plantKey = side === 'L' ? 'lPlantX' : 'rPlantX';
+      const maxTravelKey = side === 'L' ? 'lMaxTravel' : 'rMaxTravel';
+      if(this[plantKey] !== null && this[stanceKey] > 0){
+        const goodStance = this[stanceKey] > 0.12 && this[stanceKey] < 1.15 && this[maxTravelKey] > 0.075;
+        if(goodStance){
+          this.goodSteps++;
+          if(side === 'L') this.leftGoodSteps++; else this.rightGoodSteps++;
+          if(this.lastGoodFoot && this.lastGoodFoot !== side) this.altGoodSteps++;
+          if(this.lastGoodFoot === side) this.sameFootGoodSteps++;
+          this.lastGoodFoot = side;
+          this.bestDualStepMin = Math.min(this.leftGoodSteps, this.rightGoodSteps);
+        }
+      }
+      this[plantKey] = null; this[stanceKey] = 0; this[maxTravelKey] = 0;
+    };
+
+    if(contactCount){
+      support = contacts.reduce((a,f)=>a+f.x,0) / contactCount;
+      this.groundTime += dt;
+      if(contactCount === 2){
+        const bothFeetSpan = Math.abs(feet.left.x - feet.right.x);
+        const bothFeetStill = Math.max(Math.abs(feet.left.x - this.prevLX), Math.abs(feet.right.x - this.prevRX)) / dt;
+        // Keeping both feet glued down can look stable, but it is not a useful
+        // stepping strategy. Penalize long double-support while moving or while
+        // the feet are almost motionless, so actual alternating support can win.
+        if(this.age > 0.8){
+          const excessDouble = Math.max(0, this.doubleContactTime / Math.max(0.1, this.age) - (stage === 'run' ? 0.30 : 0.58));
+          const stuckWhileMoving = Math.max(0, Math.abs(this.vx) - 0.18) * (1 - smoothstep(0.06, 0.22, bothFeetStill));
+          const narrowBase = Math.max(0, 0.16 - bothFeetSpan);
+          this.gluedFeetPenalty += (excessDouble * excessDouble * 11.0 + stuckWhileMoving * 1.6 + narrowBase * 0.7) * dt;
+        }
+      }
+      for(const foot of contacts){
+        const isLeft = foot.side === 'L';
+        const prevRel = isLeft ? this.prevRelL : this.prevRelR;
+        const prevX = isLeft ? this.prevLX : this.prevRX;
+        const relVel = (foot.relX - prevRel) / dt;
+        const footVelX = (foot.x - prevX) / dt;
+        const plantKey = isLeft ? 'lPlantX' : 'rPlantX';
+        const stanceKey = isLeft ? 'lStanceTime' : 'rStanceTime';
+        const touchRelKey = isLeft ? 'lTouchRel' : 'rTouchRel';
+        const maxTravelKey = isLeft ? 'lMaxTravel' : 'rMaxTravel';
+        if(this[plantKey] === null || this[stanceKey] <= 0){
+          this[plantKey] = foot.x;
+          this[touchRelKey] = foot.relX;
+          this[maxTravelKey] = 0;
+          if(isLeft) this.leftTouchCount++; else this.rightTouchCount++;
+        }
+        this[stanceKey] += dt;
+        if(isLeft) this.leftContactTime += dt; else this.rightContactTime += dt;
+        this[maxTravelKey] = Math.max(this[maxTravelKey], Math.abs(foot.relX - this[touchRelKey]));
+
+        const penetration = clamp(0.025 - foot.y, 0, 0.12);
+        const sideStiff = isLeft ? this.j.lstiff : this.j.rstiff;
+        const sideSwing = isLeft ? this.j.lswing : this.j.rswing;
+        const rawSpring = (120 + sideStiff * 32) * penetration - (6.8 + sideStiff * 1.2) * this.vy;
+        const spring = Math.max(0, rawSpring);
+        forceY += spring / contactCount;
+        if(foot.y < -0.08) this.hoverPenalty += (-0.08 - foot.y) * (-0.08 - foot.y) * 18 * dt;
+
+        const prevRelVel = isLeft ? this.prevRelVelL : this.prevRelVelR;
+        const relAccel = (relVel - prevRelVel) / dt;
+        const sweepExcess = Math.max(0, Math.abs(relVel) - 3.8);
+        const relAccelExcess = Math.max(0, Math.abs(relAccel) - 72);
+        this.jitterPenalty += (sweepExcess * sweepExcess * 0.060 + relAccelExcess * relAccelExcess * 0.00055) * dt;
+
+        const plantSlip = foot.x - this[plantKey];
+        const backwardFootSpeed = clamp(-footVelX, 0, 3.4);
+        const loadGate = smoothstep(1.2, 6.5, spring);
+        const stanceGate = smoothstep(0.10, 0.24, this[stanceKey]);
+        const plantedGate = 1 - smoothstep(0.055, 0.22, Math.abs(plantSlip));
+        const travelGate = smoothstep(0.055, 0.18, this[maxTravelKey]);
+        const heightGate = smoothstep(0.74, 0.92, this.y) * (1 - smoothstep(1.16, 1.30, this.y));
+        const reachGate = 1 - smoothstep(1.00, 1.14, foot.reach);
+        const swingPenaltyGate = 1 - sideSwing * 0.22;
+        const driveGate = smoothstep(0.18, 0.70, backwardFootSpeed) * loadGate * stanceGate * plantedGate * travelGate * heightGate * reachGate * swingPenaltyGate;
+        this.loadedContactTime += loadGate * stanceGate * dt / contactCount;
+        this.driveContactTime += driveGate * dt / contactCount;
+
+        // Horizontal drive now needs: a loaded stance foot, some stance duration,
+        // real backward sweep, small plant slip, and a reachable body height. Tiny
+        // high-frequency toe flicks fail those gates and become penalties instead.
+        const rawSweep = -relVel * traits.sweepGain - this.vx * traits.speedDamp + traits.sweepBias;
+        const backwardSweep = clamp(rawSweep, 0, 2.45) * driveGate;
+        const behindDrive = clamp(-foot.relX * 1.15, 0, 0.92) * driveGate;
+        const extension = clamp(1.02 - (isLeft ? this.j.lk : this.j.rk), 0, 0.95) * driveGate;
+        const anklePop = Math.max(0, isLeft ? -this.j.la : -this.j.ra) * driveGate;
+
+        // Do not let a one-legged specialist keep farming distance. Once one
+        // side has touched or carried the body over 2x more than the other,
+        // that overused side loses thrust and racks up a large penalty until
+        // the neglected leg starts contributing.
+        const sideTouches = isLeft ? this.leftTouchCount : this.rightTouchCount;
+        const otherTouches = isLeft ? this.rightTouchCount : this.leftTouchCount;
+        const sideTime = isLeft ? this.leftContactTime : this.rightContactTime;
+        const otherTime = isLeft ? this.rightContactTime : this.leftContactTime;
+        const touchOveruse = Math.max(0, sideTouches - Math.max(1, otherTouches) * 2);
+        const timeOveruse = Math.max(0, sideTime - Math.max(0.18, otherTime) * 2.0);
+        const dominanceGate = 1 / (1 + touchOveruse * 2.5 + timeOveruse * 3.5);
+        const stanceStiffnessBoost = 0.86 + sideStiff * 0.28;
+        const desiredDrive = (backwardSweep * 1.05 * traits.sweepForce + behindDrive * traits.behindDrive + extension * traits.extensionDrive + anklePop * traits.ankleDrive) * this.j.muscle * dominanceGate * stanceStiffnessBoost / contactCount;
+        forceX += desiredDrive;
+        if(touchOveruse > 0 || timeOveruse > 0){
+          const harshness = stage === 'run' ? 8.5 : 5.2;
+          this.legDominancePenalty += (touchOveruse * touchOveruse * 0.35 + timeOveruse * timeOveruse * 2.2) * harshness * dt;
+        }
+        const badDriveGate = smoothstep(0.28, 0.70, backwardFootSpeed) * (1 - driveGate);
+        this.badThrustPenalty += badDriveGate * (Math.abs(rawSweep) + Math.abs(relAccel) * 0.010 + Math.max(0, this.vx)) * 0.055 * dt;
+
+        const forwardSkate = Math.max(0, footVelX - 0.05);
+        const lockedFootGlide = Math.max(0, Math.abs(this.vx) - backwardFootSpeed - 0.10);
+        this.skatePenalty += (forwardSkate * forwardSkate * 0.26 + lockedFootGlide * lockedFootGlide * (0.08 + 0.18 * (1 - driveGate)) + Math.abs(plantSlip) * 0.055) * dt;
+
+        // Strong but capped stance friction. It can carry the body over a planted
+        // foot, but not act like an unlimited invisible motor.
+        const anchorGate = loadGate * stanceGate * heightGate * reachGate * plantedGate;
+        forceX += clamp(-plantSlip * 18 - footVelX * 1.55, -2.25, 2.25) * anchorGate / contactCount;
+        if(isLeft) this.prevRelVelL = relVel; else this.prevRelVelR = relVel;
+      }
+      if(!feet.left.contact) releaseFoot('L');
+      if(!feet.right.contact) releaseFoot('R');
+      this.airStreak = 0;
+      forceX -= this.vx * 0.48;
+    } else {
+      this.airTime += dt;
+      this.airStreak += dt;
+      releaseFoot('L'); releaseFoot('R');
+      const fastAir = Math.max(0, Math.abs(this.vx) - 0.28);
+      this.hoverPenalty += (fastAir * fastAir * 0.70 + Math.max(0, this.airStreak - 0.22) * Math.max(0, this.vx) * 1.6) * dt;
+      forceX -= this.vx * (stage === 'run' ? 0.24 : 0.44);
+      forceX -= this.vx * Math.abs(this.vx) * (stage === 'run' ? 0.08 : 0.14);
+    }
+
+    // Quadratic air resistance: tiny at walking speed, noticeable when evolved gaits start exploiting high speed jitter.
+    forceX -= this.vx * Math.abs(this.vx) * traits.airDragX;
+    forceY -= this.vy * Math.abs(this.vy) * traits.airDragX * 0.45;
+
+    if(stage === 'walk' && contactCount === 0 && this.age > 0.6) forceY -= 2.2;
+
+    this.vx += forceX * dt;
+    this.vy += forceY * dt;
+    const horizontalAccel = Math.abs((this.vx - oldVx) / dt);
+    const accelExcess = Math.max(0, horizontalAccel - traits.accelTolerance);
+    this.accelPenalty += accelExcess * accelExcess * dt * 0.040;
+    this.vx = clamp(this.vx, -1.3, stage === 'run' ? 6.0 : 3.4);
+    this.y += this.vy * dt;
+    if(this.y > 1.34){ this.y = 1.34; this.vy *= 0.32; }
+
+    if(contactCount && this.y < 0.86){
+      this.y = lerp(this.y, 0.94, 0.08);
+      this.vy = Math.max(this.vy, 0);
+    }
+    if(contactCount && this.y > 1.22){
+      this.hoverPenalty += (this.y - 1.18) * (this.y - 1.18) * 46 * dt;
+    }
+    this.x += this.vx * dt;
+    this.maxX = Math.max(this.maxX, this.x);
+    this.minY = Math.min(this.minY, this.y);
+
+    const balance = clamp(this.x - support, -1.25, 1.25);
+    const leanTarget = this.j.lean + clamp((targetSpeed - this.vx) * 0.035, -0.12, 0.12);
+    const activePosture = 0.85 + this.j.muscle * 1.35;
+    const balanceTorque = contactCount ? balance * (1.25 + this.j.muscle * 0.85) : 0.06 * Math.sign(this.vx || 1);
+    this.av += ((leanTarget - this.angle) * activePosture + balanceTorque - this.angle * 0.38 - this.av * 0.16) * dt;
+    this.angle += this.av * dt;
+
+    // Natural disasters for impossible gaits.
+    if(this.age > 0.7 && (Math.abs(this.angle) > 1.15 || this.y < 0.52 || this.x < -1.2 || Math.abs(balance) > 1.08 && contactCount || this.airStreak > (stage === 'run' ? 0.72 : 0.42) && Math.abs(this.vx) > 0.55)){
+      this.alive = false;
+      this.fallen = true;
+    }
+    if(!Number.isFinite(this.x + this.y + this.vx + this.angle)){
+      this.alive = false; this.fallen = true; this.x = -10;
+    }
+    this.avgSpeed = this.age > 0 ? this.x / this.age : 0;
+    this.fitness = this.score(targetSpeed, false);
+
+    this.prevRelL = feet.left.relX; this.prevRelR = feet.right.relX;
+    if(!feet.left.contact) this.prevRelVelL *= 0.82;
+    if(!feet.right.contact) this.prevRelVelR *= 0.82;
+    this.prevLX = feet.left.x; this.prevRX = feet.right.x;
+    this.prevVx = this.vx; this.prevVy = this.vy;
+    if(this.trail.length === 0 || Math.abs(this.trail[this.trail.length-1].x - this.x) > 0.18){
+      this.trail.push({x:this.x, y:this.y});
+      if(this.trail.length > 80) this.trail.shift();
+    }
+  }
+  score(targetSpeed, final){
+    const timeLimit = stage === 'walk' ? cfg.walkTime : cfg.runTime;
+    const survival = clamp(this.age / timeLimit, 0, 1);
+    const dist = Math.max(0, this.x);
+    const avg = this.age > 0.1 ? this.x / this.age : 0;
+    const speedScore = Math.max(0, 1 - Math.abs(avg - targetSpeed) / Math.max(targetSpeed, 0.1));
+    const upright = Math.max(0, 1 - Math.abs(this.angle) / 1.05);
+    const leftSteps = this.leftGoodSteps || 0;
+    const rightSteps = this.rightGoodSteps || 0;
+    const altSteps = this.altGoodSteps || 0;
+    const maxSideSteps = Math.max(leftSteps, rightSteps);
+    const minSideSteps = Math.min(leftSteps, rightSteps);
+    const legBalance = maxSideSteps > 0 ? minSideSteps / maxSideSteps : 0;
+    const leftTouches = this.leftTouchCount || 0;
+    const rightTouches = this.rightTouchCount || 0;
+    const maxTouches = Math.max(leftTouches, rightTouches);
+    const minTouches = Math.min(leftTouches, rightTouches);
+    const touchBalance = maxTouches > 0 ? minTouches / maxTouches : 0;
+    const maxContactT = Math.max(this.leftContactTime || 0, this.rightContactTime || 0);
+    const minContactT = Math.min(this.leftContactTime || 0, this.rightContactTime || 0);
+    const contactBalance = maxContactT > 0 ? minContactT / maxContactT : 0;
+    const dominanceTouchExcess = Math.max(0, maxTouches - Math.max(1, minTouches) * 2);
+    const dominanceTimeExcess = Math.max(0, maxContactT - Math.max(0.18, minContactT) * 2.0);
+    const dominancePenalty = (dominanceTouchExcess * dominanceTouchExcess * (stage === 'run' ? 13.0 : 8.0) + dominanceTimeExcess * dominanceTimeExcess * (stage === 'run' ? 46.0 : 28.0)) * clamp(dist / 3.0, 0.25, 1.8);
+    const generalStepScore = clamp((this.goodSteps * 0.70 + this.steps * 0.10) / (stage === 'run' ? 18 : 13), 0, 1);
+    const bipedStepScore = clamp((minSideSteps * 1.15 + altSteps * 0.85) / (stage === 'run' ? 12 : 8), 0, 1);
+    // Quality should come mostly from real left/right step releases, not from
+    // simply touching both feet to the floor. Touch/contact balance is a safety
+    // gate, but it is no longer a big positive reward by itself.
+    const bipedQuality = clamp(legBalance * 0.46 + bipedStepScore * 0.54, 0, 1);
+    const twoLegUseScore = clamp((minSideSteps * 1.25 + altSteps * 1.05 + Math.min(minTouches, 6) * 0.18) / (stage === 'run' ? 13.0 : 8.6), 0, 1);
+    const softMonoCap = stage === 'run' ? 5.0 : 3.2;
+    const progressGate = clamp(0.28 + bipedQuality * 0.72, 0.28, 1);
+    const bipedDist = Math.min(dist, softMonoCap) + Math.max(0, dist - softMonoCap) * progressGate;
+    const sameFootPenalty = (this.sameFootGoodSteps || 0) * (stage === 'run' ? 1.0 : 1.35);
+    const oneLegDistancePenalty = Math.max(0, dist - softMonoCap) * (1 - legBalance) * (stage === 'run' ? 6.5 : 8.0);
+    const energyPenalty = this.energy * (stage === 'run' ? 0.015 : 0.019);
+    const contactHealth = clamp((this.loadedContactTime + this.driveContactTime * 1.8) / Math.max(0.1, this.age), 0, 1);
+    const unsupportedSpeedPenalty = Math.max(0, avg - 0.45) * Math.max(0, avg - 0.45) * (1 - contactHealth) * (stage === 'run' ? 10 : 18);
+    const hoverRatio = this.airTime / Math.max(0.1, this.age);
+    const doubleRatio = this.doubleContactTime / Math.max(0.1, this.age);
+    const singleRatio = this.singleContactTime / Math.max(0.1, this.age);
+    const maxDouble = stage === 'run' ? 0.34 : 0.62;
+    const doubleSupportPenalty = Math.max(0, doubleRatio - maxDouble) * Math.max(0, doubleRatio - maxDouble) * (stage === 'run' ? 34 : 22) * (0.5 + survival);
+    const contactMixScore = stage === 'run'
+      ? clamp(singleRatio * 1.3 + hoverRatio * 0.5 - Math.max(0, doubleRatio - 0.22) * 1.6, 0, 1)
+      : clamp(singleRatio * 0.9 + Math.min(doubleRatio, 0.45) * 0.35 - Math.max(0, doubleRatio - 0.62) * 1.2, 0, 1);
+    const antiExploitPenalty = this.accelPenalty + this.jitterPenalty + this.skatePenalty + this.hoverPenalty + this.badThrustPenalty + this.legDominancePenalty + this.gluedFeetPenalty + unsupportedSpeedPenalty + oneLegDistancePenalty + dominancePenalty + sameFootPenalty + doubleSupportPenalty;
+    const fallPenalty = this.fallen ? (stage === 'run' ? 9 : 7) : 0;
+    let fit = 0;
+    if(stage === 'walk'){
+      const walkContacts = this.groundTime / Math.max(0.1, this.age);
+      fit = bipedDist * 11.4 + survival * 7 + speedScore * 7 + upright * 4 + generalStepScore * 1.4 + bipedStepScore * 15 + twoLegUseScore * 7 + legBalance * 3 + contactMixScore * 5 + contactHealth * 3.4 - hoverRatio * 14 - energyPenalty - antiExploitPenalty - fallPenalty;
+      // Let imperfect movers survive long enough to become alternating walkers.
+      // The big bonus still needs real biped stepping, but raw progress matters.
+      if(dist > 1.0 && avg > 0.18) fit += Math.min(dist, cfg.trackWinWalk) * 1.7;
+      if(avg > 0.85 && dist > cfg.trackWinWalk && leftSteps >= 3 && rightSteps >= 3 && altSteps >= 4) fit += 35;
+      if(dist > 7 && (leftSteps < 2 || rightSteps < 2)) fit -= (dist - 7) * 13;
+      if(dist > 3 && maxTouches > 3 && touchBalance < 0.44) fit -= (dist - 3) * (0.44 - touchBalance) * 23;
+      if(avg > 2.05) fit -= (avg - 2.05) * 10;
+    } else {
+      const airRatio = this.airTime / Math.max(0.1, this.age);
+      fit = bipedDist * 13.2 + survival * 6 + speedScore * 12 + upright * 3.5 + generalStepScore * 1.4 + bipedStepScore * 13 + twoLegUseScore * 8 + legBalance * 2.5 + contactMixScore * 4 + contactHealth * 3.2 - Math.max(0, airRatio - 0.46) * 18 - energyPenalty - antiExploitPenalty - fallPenalty;
+      if(dist > 1.5 && avg > 0.35) fit += Math.min(dist, cfg.trackWinRun) * 1.3;
+      if(avg > 2.45 && dist > cfg.trackWinRun && leftSteps >= 4 && rightSteps >= 4 && altSteps >= 6 && touchBalance >= 0.50 && contactBalance >= 0.42) fit += 70;
+      if(dist > 9 && (leftSteps < 3 || rightSteps < 3)) fit -= (dist - 9) * 13;
+      if(dist > 4 && maxTouches > 3 && touchBalance < 0.46) fit -= (dist - 4) * (0.46 - touchBalance) * 46;
+      if(dist > 4 && contactBalance < 0.38) fit -= (dist - 4) * (0.38 - contactBalance) * 36;
+    }
+    if(this.x < 0) fit += this.x * 16;
+    if(final && !this.fallen) fit += 5;
+    return fit;
+  }
+}
+
+function makeRandomGenome(scale=0.8){
+  const g = new Float32Array(genomeLength);
+  for(let i=0;i<g.length;i++) g[i] = randn() * scale;
+  return g;
+}
+function cloneGenome(g){ return new Float32Array(g); }
+function mutate(g, rate, power){
+  const out = cloneGenome(g);
+  for(let i=0;i<out.length;i++){
+    if(rng() < rate) out[i] += randn() * power;
+    if(rng() < rate * 0.025) out[i] *= rand(0.25, 1.75);
+    out[i] = clamp(out[i], -6, 6);
+  }
+  return out;
+}
+function crossover(a,b){
+  const g = new Float32Array(genomeLength);
+  const cut1 = Math.floor(rand(0, genomeLength));
+  const cut2 = Math.floor(rand(cut1, genomeLength));
+  for(let i=0;i<g.length;i++){
+    if(i>=cut1 && i<cut2) g[i] = b[i];
+    else g[i] = rng() < 0.5 ? a[i] : b[i];
+    if(rng() < 0.08) g[i] = (a[i] + b[i]) * 0.5;
+  }
+  return g;
+}
+function genomeIndexHidden(j, i){ return j * (cfg.inputCount + 1) + 1 + i; }
+function genomeIndexHiddenBias(j){ return j * (cfg.inputCount + 1); }
+function genomeIndexOutput(o, j){ return (cfg.inputCount + 1) * cfg.hiddenCount + o * (cfg.hiddenCount + 1) + 1 + j; }
+function genomeIndexOutputBias(o){ return (cfg.inputCount + 1) * cfg.hiddenCount + o * (cfg.hiddenCount + 1); }
+function swapHiddenInputs(g, a, b){
+  for(let j=0;j<cfg.hiddenCount;j++){
+    const ia = genomeIndexHidden(j, a), ib = genomeIndexHidden(j, b);
+    const t = g[ia]; g[ia] = g[ib]; g[ib] = t;
+  }
+}
+function swapOutputRows(g, a, b){
+  const ba = genomeIndexOutputBias(a), bb = genomeIndexOutputBias(b);
+  let t = g[ba]; g[ba] = g[bb]; g[bb] = t;
+  for(let j=0;j<cfg.hiddenCount;j++){
+    const ia = genomeIndexOutput(a, j), ib = genomeIndexOutput(b, j);
+    t = g[ia]; g[ia] = g[ib]; g[ib] = t;
+  }
+}
+function mirroredGenome(genome){
+  const g = cloneGenome(genome);
+  // Swap left/right sensor paths and motor outputs. These mirror mutants stop a
+  // one-legged local optimum from monopolizing the gene pool: the GA can cross a
+  // left-leg specialist with its right-leg mirror and discover alternating gaits.
+  swapHiddenInputs(g, 7, 8);   // left/right contacts
+  swapHiddenInputs(g, 9, 10);  // left/right foot positions
+  swapHiddenInputs(g, 11, 12); // left/right hip states
+  swapHiddenInputs(g, 13, 14); // left/right knee states
+  swapHiddenInputs(g, 18, 19); // left/right foot heights
+  swapHiddenInputs(g, 20, 21); // left/right foot rel velocities
+  swapHiddenInputs(g, 22, 23); // left/right stance timers
+  swapHiddenInputs(g, 24, 25); // left/right contact-time ratios
+  swapHiddenInputs(g, 26, 27); // left/right touch counts
+  swapHiddenInputs(g, 28, 29); // left/right good steps
+  swapHiddenInputs(g, 32, 33); // left/right ankles
+  swapHiddenInputs(g, 35, 38); // previous left/right hip commands
+  swapHiddenInputs(g, 36, 39); // previous left/right knee commands
+  swapHiddenInputs(g, 37, 40); // previous left/right ankle commands
+  swapHiddenInputs(g, 41, 42); // previous arm commands
+  swapHiddenInputs(g, 45, 46); // previous swing commands
+  swapHiddenInputs(g, 47, 48); // previous stance stiffness commands
+  swapOutputRows(g, 0, 3); swapOutputRows(g, 1, 4); swapOutputRows(g, 2, 5);
+  swapOutputRows(g, 6, 7); swapOutputRows(g, 10, 11); swapOutputRows(g, 12, 13);
+  return g;
+}
+
+function makeStarterGenome(kind='walk'){
+  const g = new Float32Array(genomeLength);
+  // Hidden nodes mirror oscillator and feedback inputs; output layer combines them into a rough gait.
+  const H = {
+    sinP:0, sinN:1, cosP:2, cosN:3, slow:4, fast:5, leanF:6, leanB:7,
+    contactL:8, contactR:9, speedLow:10, speedHigh:11
+  };
+  function h(j, input, weight, bias=0){ g[genomeIndexHiddenBias(j)] = bias; g[genomeIndexHidden(j,input)] = weight; }
+  h(H.sinP, 0, kind === 'run' ? 3.0 : 2.65);
+  h(H.sinN, 0, kind === 'run' ? -3.0 : -2.65);
+  h(H.cosP, 1, 2.4);
+  h(H.cosN, 1, -2.4);
+  h(H.slow, 16, -1.4, 0.2);
+  h(H.fast, 16, 1.4, -0.1);
+  h(H.leanF, 4, -2.0);
+  h(H.leanB, 4, 2.0);
+  h(H.contactL, 7, 2.2, -0.7);
+  h(H.contactR, 8, 2.2, -0.7);
+  h(H.speedLow, 3, 1.7, -0.35);
+  h(H.speedHigh, 2, 1.2, -0.7);
+  function o(out, hidden, weight){ g[genomeIndexOutput(out,hidden)] += weight; }
+  function ob(out, bias){ g[genomeIndexOutputBias(out)] = bias; }
+  const runBoost = kind === 'run' ? 1.22 : 1.0;
+  // left hip, left knee, left ankle
+  o(0,H.sinP,1.35*runBoost); o(0,H.speedLow,0.18); ob(0,0.02);
+  o(1,H.sinP,0.95); o(1,H.cosN,0.28); ob(1,-0.38);
+  o(2,H.sinN,-0.18); o(2,H.contactL,-0.38); ob(2,-0.05);
+  // right hip, right knee, right ankle
+  o(3,H.sinN,1.35*runBoost); o(3,H.speedLow,0.18); ob(3,0.02);
+  o(4,H.sinN,0.95); o(4,H.cosP,0.28); ob(4,-0.38);
+  o(5,H.sinP,-0.18); o(5,H.contactR,-0.38); ob(5,-0.05);
+  // arms counter-swing
+  o(6,H.sinN,1.25); ob(6,0);
+  o(7,H.sinP,1.25); ob(7,0);
+  // lean and muscle
+  o(8,H.leanF,0.55); o(8,H.speedLow,0.20); o(8,H.fast,0.10); ob(8, kind === 'run' ? 0.18 : 0.06);
+  o(9,H.fast,0.35); o(9,H.speedLow,0.24); ob(9, kind === 'run' ? 0.28 : 0.08);
+  g[traitStart + 9] = 1.75; // seeded gaits deliberately get a strong clock; cold-start genomes must evolve it.
+  g[traitStart + 10] = kind === 'run' ? 0.35 : 0.0;
+  g[traitStart + 11] = 0.25;
+  g[traitStart + 12] = 0.15;
+  return g;
+}
+
+function initPopulation(seeded=false){
+  population = [];
+  const baseWalk = makeStarterGenome('walk');
+  const baseRun = makeStarterGenome('run');
+  for(let i=0;i<cfg.popSize;i++){
+    let g;
+    if(seeded && i < cfg.popSize * 0.42) g = mutate(baseWalk, 0.22, 0.42);
+    else if(seeded && i < cfg.popSize * 0.54) g = mutate(baseRun, 0.26, 0.50);
+    else g = makeRandomGenome(0.72);
+    population.push(new Agent(g, i));
+  }
+  bestThisGen = population[0];
+}
+
+function tournament(sorted){
+  let best = sorted[Math.floor(rand(0, sorted.length))];
+  for(let i=0;i<3;i++){
+    const c = sorted[Math.floor(Math.pow(rng(), 1.7) * sorted.length)];
+    if(c.fitness > best.fitness) best = c;
+  }
+  return best;
+}
+
+function gaitStats(a){
+  const left = a && (a.leftGoodSteps || 0);
+  const right = a && (a.rightGoodSteps || 0);
+  const alt = a && (a.altGoodSteps || 0);
+  const maxSide = Math.max(left, right);
+  const balance = maxSide > 0 ? Math.min(left, right) / maxSide : 0;
+  const leftTouches = a && (a.leftTouchCount || 0);
+  const rightTouches = a && (a.rightTouchCount || 0);
+  const maxTouches = Math.max(leftTouches, rightTouches);
+  const touchBalance = maxTouches > 0 ? Math.min(leftTouches, rightTouches) / maxTouches : 0;
+  const maxContactT = Math.max(a && (a.leftContactTime || 0), a && (a.rightContactTime || 0));
+  const contactBalance = maxContactT > 0 ? Math.min(a && (a.leftContactTime || 0), a && (a.rightContactTime || 0)) / maxContactT : 0;
+  return {left, right, alt, balance, touchBalance, contactBalance};
+}
+function validBipedGait(a, mode){
+  const s = gaitStats(a);
+  const contactRatio = (a && a.age) ? (a.loadedContactTime || 0) / Math.max(0.1, a.age) : 0;
+  const doubleRatio = (a && a.age) ? (a.doubleContactTime || 0) / Math.max(0.1, a.age) : 0;
+  if(mode === 'run') return s.left >= 4 && s.right >= 4 && s.alt >= 6 && s.balance >= 0.45 && s.touchBalance >= 0.50 && s.contactBalance >= 0.42 && contactRatio > 0.12 && doubleRatio < 0.42;
+  return s.left >= 3 && s.right >= 3 && s.alt >= 4 && s.balance >= 0.45 && s.touchBalance >= 0.45 && s.contactBalance >= 0.38 && contactRatio > 0.16 && doubleRatio < 0.70;
+}
+
+function behaviorVector(a){
+  const s = gaitStats(a);
+  const age = Math.max(0.1, a.age || 0);
+  const goal = stage === 'run' ? cfg.trackWinRun : cfg.trackWinWalk;
+  return [
+    clamp((a.x || 0) / goal, -0.2, 1.6),
+    clamp((a.avgSpeed || 0) / Math.max(0.1, targetSpeed()), -0.5, 2.0),
+    clamp(s.left / 8, 0, 2),
+    clamp(s.right / 8, 0, 2),
+    clamp(s.alt / 8, 0, 2),
+    clamp(s.balance, 0, 1),
+    clamp(s.touchBalance, 0, 1),
+    clamp(s.contactBalance, 0, 1),
+    clamp((a.doubleContactTime || 0) / age, 0, 1.4),
+    clamp((a.airTime || 0) / age, 0, 1.4)
+  ];
+}
+function behaviorDistanceVec(a,b){
+  let d = 0;
+  for(let i=0;i<a.length;i++){ const x = a[i] - b[i]; d += x*x; }
+  return Math.sqrt(d / a.length);
+}
+function assignNovelty(pop){
+  const vectors = pop.map(behaviorVector);
+  for(let i=0;i<pop.length;i++){
+    const distances = [];
+    for(let j=0;j<pop.length;j++) if(i !== j) distances.push(behaviorDistanceVec(vectors[i], vectors[j]));
+    distances.sort((a,b)=>a-b);
+    const k = Math.min(5, distances.length);
+    let score = 0;
+    for(let n=0;n<k;n++) score += distances[n];
+    pop[i].novelty = k ? score / k : 0;
+  }
+}
+function populationDiversity(pop){
+  if(pop.length < 2) return 0;
+  const sample = Math.min(72, genomeLength);
+  const stride = Math.max(1, Math.floor(genomeLength / sample));
+  let total = 0, pairs = 0;
+  const n = Math.min(pop.length, 22);
+  for(let i=0;i<n;i++){
+    for(let j=i+1;j<n;j++){
+      let d = 0, c = 0;
+      for(let k=0;k<genomeLength;k+=stride){
+        d += Math.abs((pop[i].genome[k] || 0) - (pop[j].genome[k] || 0)); c++;
+      }
+      total += d / Math.max(1,c); pairs++;
+    }
+  }
+  return pairs ? total / pairs : 0;
+}
+function progressMetric(a){
+  if(!a) return -Infinity;
+  const s = gaitStats(a);
+  const age = Math.max(0.1, a.age || 0);
+  const dist = Math.max(0, a.x || 0);
+  const minSteps = Math.min(s.left, s.right);
+  const maxSteps = Math.max(s.left, s.right);
+  const doubleRatio = (a.doubleContactTime || 0) / age;
+  const hoverRatio = (a.airTime || 0) / age;
+  const oneLegTrap = Math.max(0, maxSteps - Math.max(1, minSteps) * 2) * 0.75 + Math.max(0, 0.42 - s.balance) * Math.max(0, dist - 2.5) * 0.55;
+  const gluedTrap = Math.max(0, doubleRatio - (stage === 'run' ? 0.42 : 0.66)) * Math.max(0, dist - 1.0) * 2.0;
+  const hoverTrap = Math.max(0, hoverRatio - (stage === 'run' ? 0.50 : 0.30)) * Math.max(0, dist - 1.0) * 2.0;
+  return dist * 1.25 + Math.max(0, a.avgSpeed || 0) * 2.4 + minSteps * 2.0 + (s.alt || 0) * 1.4 + s.balance * 3.0 + s.touchBalance * 1.6 - oneLegTrap - gluedTrap - hoverTrap;
+}
+function analyzeStagnation(sorted, avgFitness, diversity){
+  const best = sorted[0];
+  const progress = progressMetric(best);
+  stagnation.lastProgress = progress;
+  stagnation.lastDiversity = diversity;
+  const improved = progress > stagnation.bestProgress + (stage === 'run' ? 0.55 : 0.38);
+  if(improved){
+    stagnation.bestProgress = progress;
+    stagnation.stale = 0;
+    if(stagnation.lastAction !== 'normal') stagnation.lastAction = 'recovering';
+  } else {
+    stagnation.stale++;
+  }
+  const s = gaitStats(best);
+  const age = Math.max(0.1, best.age || 0);
+  const dist = Math.max(0, best.x || 0);
+  const oneLegTrap = dist > 2.6 && Math.max(s.left, s.right) >= 2 && s.balance < 0.34;
+  const gluedTrap = dist > 1.4 && (best.doubleContactTime || 0) / age > (stage === 'run' ? 0.48 : 0.76);
+  const lowDiversity = diversity < 0.47;
+  const noRecentEscape = generation - stagnation.lastEscapeGen > 4;
+  let reason = '';
+  if(stagnation.stale >= 8) reason = 'stale';
+  if(stagnation.stale >= 5 && oneLegTrap) reason = 'one-leg trap';
+  if(stagnation.stale >= 5 && gluedTrap) reason = 'glued-feet trap';
+  if(stagnation.stale >= 6 && lowDiversity) reason = 'low diversity';
+  const triggered = Boolean(reason && noRecentEscape);
+  if(triggered){
+    stagnation.escapes++;
+    stagnation.lastEscapeGen = generation;
+    stagnation.lastAction = reason;
+    stagnation.lastReason = reason;
+    stagnation.stale = Math.floor(stagnation.stale * 0.45);
+  }
+  return {triggered, reason, progress, oneLegTrap, gluedTrap, lowDiversity};
+}
+
+function evolve(){
+  const target = targetSpeed();
+  for(const a of population){ a.fitness = a.score(target, true); a.avgSpeed = a.age > 0 ? a.x / a.age : 0; }
+  assignNovelty(population);
+  population.sort((a,b)=>b.fitness-a.fitness);
+  const avg = population.reduce((sum,a)=>sum+a.fitness,0) / population.length;
+  const diversity = populationDiversity(population);
+  const escape = analyzeStagnation(population, avg, diversity);
+
+  // When the population has been stale for a while, give novel behaviors a
+  // small selection nudge even before a full partial restart is triggered.
+  if(stagnation.stale >= 3){
+    const noveltyBoost = stage === 'run' ? 3.2 : 2.4;
+    for(const a of population) a.fitness += (a.novelty || 0) * noveltyBoost;
+    population.sort((a,b)=>b.fitness-a.fitness);
+  }
+
+  bestThisGen = population[0];
+  if(!bestEver || bestThisGen.fitness > bestEver.fitness || (stage === 'run' && bestThisGen.x > bestEver.x && bestThisGen.avgSpeed > 1.5)){
+    bestEver = snapshotAgent(bestThisGen);
+  }
+  const adjustedAvg = population.reduce((s,a)=>s+a.fitness,0) / population.length;
+  history.push({best: bestThisGen.fitness, avg: adjustedAvg, dist: bestThisGen.x, speed: bestThisGen.avgSpeed, stage});
+  if(history.length > 170) history.shift();
+
+  const walkUnlocked = bestThisGen.x > cfg.trackWinWalk && bestThisGen.avgSpeed > 0.85 && validBipedGait(bestThisGen, 'walk') || bestEver && bestEver.x > cfg.trackWinWalk && bestEver.avgSpeed > 0.85 && validBipedGait(bestEver, 'walk');
+  if(stage === 'walk' && walkUnlocked){
+    stage = 'run';
+    stagnation = makeStagnation();
+    // Inject the best walker into a run-biased gene pool instead of starting over.
+    const champion = cloneGenome(bestThisGen.genome);
+    population = [];
+    population.push(new Agent(champion, 0, bestThisGen.fitness));
+    for(let i=1;i<cfg.popSize;i++){
+      let child = cloneGenome(champion);
+      if(i % 5 === 0) child = crossover(champion, makeRandomGenome(0.52));
+      if(i % 7 === 0) child = crossover(child, mirroredGenome(champion));
+      population.push(new Agent(mutate(child, 0.18, 0.44), i, bestThisGen.fitness));
+    }
+    bestEver = snapshotAgent(population[0]);
+    generation++;
+    episodeTime = 0;
+    return;
+  }
+  if(stage === 'run' && !won && bestThisGen.x > cfg.trackWinRun && bestThisGen.avgSpeed > 2.45 && validBipedGait(bestThisGen, 'run')){
+    won = true;
+  }
+
+  const next = [];
+  const mutationRate = Number(els.mutation.value) / 100;
+  const noveltyRanked = [...population].sort((a,b)=>(b.novelty||0)-(a.novelty||0));
+  const keepElites = escape.triggered ? Math.min(2, cfg.eliteCount) : cfg.eliteCount;
+  for(let i=0;i<keepElites;i++){
+    next.push(new Agent(cloneGenome(population[i].genome), i, population[i].fitness));
+  }
+
+  const immigrantCount = escape.triggered ? Math.ceil(cfg.popSize * 0.25) : 0;
+  const hyperCount = escape.triggered ? Math.ceil(cfg.popSize * 0.22) : 0;
+  const mirrorCount = escape.triggered ? Math.ceil(cfg.popSize * 0.18) : 6;
+
+  for(let i=keepElites;i<cfg.popSize;i++){
+    let child;
+    const power = stage === 'run' ? 0.26 : 0.21;
+    const slotFromEnd = cfg.popSize - i;
+    if(escape.triggered && slotFromEnd <= immigrantCount){
+      // Random immigrants are the direct escape hatch: about 25% of the pool is
+      // rebuilt from scratch so the population cannot stay genetically trapped.
+      child = makeRandomGenome(stage === 'run' ? 0.90 : 0.80);
+    } else if(escape.triggered && i < keepElites + hyperCount){
+      // Hypermutate a mix of elites and behaviorally novel agents.
+      const p = (i % 2 === 0) ? population[i % Math.min(8, population.length)] : noveltyRanked[i % Math.min(10, noveltyRanked.length)];
+      let base = cloneGenome(p.genome);
+      if(i % 3 === 0) base = crossover(base, mirroredGenome(base));
+      if(i % 5 === 0) base = crossover(base, makeRandomGenome(0.70));
+      child = mutate(base, Math.max(mutationRate * 2.2, 0.15), stage === 'run' ? 0.62 : 0.54);
+    } else if(i < keepElites + hyperCount + mirrorCount){
+      const p = population[(i - keepElites) % Math.min(cfg.eliteCount + 2, population.length)];
+      child = crossover(p.genome, mirroredGenome(p.genome));
+      child = mutate(child, Math.max(mutationRate, 0.080), power * 1.45);
+    } else if(i > cfg.popSize - 6 && rng() < 0.70){
+      child = makeRandomGenome(stage === 'run' ? 0.78 : 0.72);
+    } else {
+      const useNovel = stagnation.stale >= 3 && rng() < 0.28;
+      const p1 = useNovel ? noveltyRanked[Math.floor(rand(0, Math.min(12, noveltyRanked.length)))] : tournament(population);
+      const p2 = tournament(population);
+      child = crossover(p1.genome, p2.genome);
+      child = mutate(child, mutationRate * (stagnation.stale >= 3 ? 1.25 : 1), power);
+    }
+    next.push(new Agent(child, i));
+  }
+  population = next;
+  generation++;
+  episodeTime = 0;
+  generationJustEvolved = true;
+}
+function targetSpeed(){ return stage === 'run' ? cfg.runTarget : cfg.walkTarget; }
+function timeLimit(){ return stage === 'run' ? cfg.runTime : cfg.walkTime; }
+function snapshotAgent(a){
+  return {
+    genome: cloneGenome(a.genome), fitness: a.fitness, x: a.x, avgSpeed: a.avgSpeed, age: a.age,
+    goodSteps: a.goodSteps || 0, leftGoodSteps: a.leftGoodSteps || 0, rightGoodSteps: a.rightGoodSteps || 0,
+    altGoodSteps: a.altGoodSteps || 0, sameFootGoodSteps: a.sameFootGoodSteps || 0,
+    leftTouchCount: a.leftTouchCount || 0, rightTouchCount: a.rightTouchCount || 0,
+    leftContactTime: a.leftContactTime || 0, rightContactTime: a.rightContactTime || 0,
+    loadedContactTime: a.loadedContactTime || 0, driveContactTime: a.driveContactTime || 0,
+    trail: a.trail ? a.trail.map(p => ({x:p.x,y:p.y})) : [], stage
+  };
+}
+
+function update(){
+  if(paused) return;
+  let steps = Number(els.speed.value);
+  for(let s=0;s<steps;s++){
+    const target = targetSpeed();
+    episodeTime += cfg.dt;
+    let alive = 0;
+    let leader = null;
+    for(const a of population){
+      a.step(cfg.dt, target);
+      if(a.alive) alive++;
+      if(!leader || a.fitness > leader.fitness) leader = a;
+    }
+    bestThisGen = leader || population[0];
+    if(episodeTime >= timeLimit() || alive === 0) evolve();
+  }
+}
+
+function resize(){
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.floor(rect.width * dpr);
+  canvas.height = Math.floor(rect.height * dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener('resize', resize);
+
+function worldToScreen(x,y){
+  const ground = canvas.clientHeight - 74;
+  return {x:(x - cameraX) * cfg.scale + canvas.clientWidth * 0.28, y:ground - y * cfg.scale};
+}
+function drawLine(a,b,color,width=3,alpha=1){
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+function drawAgent(a, color='#e5f4ff', alpha=1, width=3.2){
+  if(!a) return;
+  const feet = a.computeFeet ? a.computeFeet() : null;
+  const hip = worldToScreen(a.x, a.y);
+  const torsoLen = 0.72, neckLen = 0.13;
+  const shoulderW = 0.23;
+  const torsoAngle = a.angle;
+  const chestW = {x: a.x + Math.sin(torsoAngle) * torsoLen, y: a.y + Math.cos(torsoAngle) * torsoLen};
+  const neckW = {x: chestW.x + Math.sin(torsoAngle) * neckLen, y: chestW.y + Math.cos(torsoAngle) * neckLen};
+  const chest = worldToScreen(chestW.x, chestW.y);
+  const neck = worldToScreen(neckW.x, neckW.y);
+  const head = worldToScreen(neckW.x + Math.sin(torsoAngle) * 0.08, neckW.y + Math.cos(torsoAngle) * 0.08);
+  drawLine(hip, chest, color, width, alpha);
+  drawLine(chest, neck, color, width, alpha);
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = color; ctx.lineWidth = width; ctx.beginPath(); ctx.arc(head.x, head.y - 7, 10, 0, Math.PI*2); ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  function drawLeg(leg, hipColor){
+    const knee = worldToScreen(leg.kneeX, leg.kneeY);
+    const foot = worldToScreen(leg.x, Math.max(leg.y,0));
+    drawLine(hip,knee,hipColor,width,alpha);
+    drawLine(knee,foot,hipColor,width,alpha);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = leg.contact ? '#a7f3d0' : hipColor;
+    ctx.beginPath(); ctx.ellipse(foot.x + (leg.side === 'L' ? -3 : 3), foot.y + 2, 8, 3, 0, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  if(feet){ drawLeg(feet.left, color); drawLeg(feet.right, color); }
+
+  const lShoulder = {x: chestW.x - Math.cos(torsoAngle) * shoulderW, y: chestW.y + Math.sin(torsoAngle) * shoulderW};
+  const rShoulder = {x: chestW.x + Math.cos(torsoAngle) * shoulderW, y: chestW.y - Math.sin(torsoAngle) * shoulderW};
+  function arm(shoulder, ang, side){
+    const a1 = torsoAngle + ang + (side === 'L' ? -0.12 : 0.12);
+    const elbowW = {x: shoulder.x + Math.sin(a1) * 0.36, y: shoulder.y - Math.cos(a1) * 0.36};
+    const handW = {x: elbowW.x + Math.sin(a1 + (side === 'L' ? 0.35 : -0.35)) * 0.32, y: elbowW.y - Math.cos(a1 + (side === 'L' ? 0.35 : -0.35)) * 0.32};
+    const sp = worldToScreen(shoulder.x, shoulder.y), ep = worldToScreen(elbowW.x, elbowW.y), hp = worldToScreen(handW.x, handW.y);
+    drawLine(sp, ep, color, width*0.72, alpha*0.85); drawLine(ep, hp, color, width*0.72, alpha*0.85);
+  }
+  arm(lShoulder, a.j ? a.j.ls : 0, 'L'); arm(rShoulder, a.j ? a.j.rs : 0, 'R');
+}
+
+function drawWorld(){
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0,0,w,h);
+  const ground = h - 74;
+  const grad = ctx.createLinearGradient(0,0,0,h);
+  grad.addColorStop(0,'#0c1429'); grad.addColorStop(1,'#07101e');
+  ctx.fillStyle = grad; ctx.fillRect(0,0,w,h);
+
+  let camTarget = 0;
+  const leader = bestThisGen || population[0];
+  if(els.cameraMode.value === 'leader') camTarget = leader ? leader.x - 0.9 : 0;
+  else if(els.cameraMode.value === 'best') camTarget = bestEver ? bestEver.x - 0.9 : 0;
+  else camTarget = 0;
+  cameraX = lerp(cameraX, camTarget, 0.08);
+
+  // track grid
+  ctx.strokeStyle = 'rgba(125,211,252,.13)'; ctx.lineWidth = 1;
+  const startM = Math.floor(cameraX - w / cfg.scale);
+  const endM = Math.ceil(cameraX + w / cfg.scale);
+  for(let x=startM;x<=endM;x++){
+    const sx = worldToScreen(x,0).x;
+    if(sx < -30 || sx > w+30) continue;
+    ctx.beginPath(); ctx.moveTo(sx,ground); ctx.lineTo(sx,ground+12); ctx.stroke();
+    if(x % 5 === 0){
+      ctx.fillStyle = 'rgba(220,235,255,.45)'; ctx.font = '12px ui-monospace, monospace'; ctx.fillText(`${x} m`, sx+4, ground+31);
+      ctx.beginPath(); ctx.moveTo(sx,0); ctx.lineTo(sx,ground); ctx.strokeStyle='rgba(125,211,252,.05)'; ctx.stroke(); ctx.strokeStyle = 'rgba(125,211,252,.13)';
+    }
+  }
+  ctx.strokeStyle = '#52658d'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(0,ground); ctx.lineTo(w,ground); ctx.stroke();
+  ctx.fillStyle = '#07101e'; ctx.fillRect(0,ground+3,w,h-ground);
+
+  const goal = stage === 'walk' ? cfg.trackWinWalk : cfg.trackWinRun;
+  const goalX = worldToScreen(goal,0).x;
+  if(goalX > -80 && goalX < w + 80){
+    ctx.strokeStyle = stage === 'walk' ? '#7dd3fc' : '#a7f3d0'; ctx.lineWidth = 2; ctx.setLineDash([6,5]);
+    ctx.beginPath(); ctx.moveTo(goalX,20); ctx.lineTo(goalX,ground); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = stage === 'walk' ? '#7dd3fc' : '#a7f3d0'; ctx.font = 'bold 12px ui-sans-serif, system-ui';
+    ctx.fillText(stage === 'walk' ? 'WALK UNLOCK' : 'RUN WIN', goalX+8, 36);
+  }
+
+  const sorted = [...population].sort((a,b)=>a.x-b.x);
+  for(const a of sorted){
+    if(!a.alive) continue;
+    const alpha = a === bestThisGen ? 0 : 0.13;
+    if(alpha) drawAgent(a, '#9fb0cc', alpha, 2.1);
+  }
+  if(bestThisGen){
+    if(bestThisGen.trail.length > 2){
+      ctx.strokeStyle = 'rgba(125,211,252,.33)'; ctx.lineWidth = 2; ctx.beginPath();
+      bestThisGen.trail.forEach((p,i)=>{ const sp=worldToScreen(p.x,p.y); if(i===0)ctx.moveTo(sp.x,sp.y); else ctx.lineTo(sp.x,sp.y); }); ctx.stroke();
+    }
+    drawAgent(bestThisGen, won ? '#fef08a' : '#eaf7ff', 1, 4.2);
+  }
+
+  if(bestEver && els.cameraMode.value !== 'leader'){
+    const ghost = new Agent(bestEver.genome, -1);
+    ghost.x = bestEver.x; ghost.y = 1.05; ghost.age = bestEver.age || 0;
+    drawAgent(ghost, '#a7f3d0', 0.38, 2.7);
+  }
+
+  ctx.fillStyle = 'rgba(7,12,24,.72)'; ctx.fillRect(16,18,Math.min(560,w-32),62);
+  ctx.strokeStyle = 'rgba(125,211,252,.18)'; ctx.strokeRect(16,18,Math.min(560,w-32),62);
+  ctx.fillStyle = '#ecf4ff'; ctx.font = 'bold 18px ui-sans-serif, system-ui';
+  const title = won ? 'Run unlocked: stable fast locomotion achieved!' : stage === 'walk' ? 'Goal: evolve a balanced walking gait' : 'Goal: turn the walker into a runner';
+  ctx.fillText(title, 30, 43);
+  ctx.fillStyle = '#9fb0cc'; ctx.font = '13px ui-sans-serif, system-ui';
+  const sub = `Target ${ms(targetSpeed())} · best now ${bestThisGen ? m(Math.max(0,bestThisGen.x)) : '0.0 m'} · average speed ${bestThisGen ? ms(bestThisGen.avgSpeed) : '0.00 m/s'}`;
+  ctx.fillText(sub, 30, 64);
+}
+
+function drawChart(){
+  const w = chart.width, h = chart.height;
+  cctx.clearRect(0,0,w,h);
+  cctx.fillStyle = '#081020'; cctx.fillRect(0,0,w,h);
+  cctx.strokeStyle = 'rgba(255,255,255,.08)'; cctx.lineWidth = 1;
+  for(let i=1;i<4;i++){ cctx.beginPath(); cctx.moveTo(0,h*i/4); cctx.lineTo(w,h*i/4); cctx.stroke(); }
+  if(history.length < 2) return;
+  const maxFit = Math.max(...history.map(v=>Math.max(v.best, v.avg)), 10);
+  function plot(key, color){
+    cctx.strokeStyle = color; cctx.lineWidth = 2; cctx.beginPath();
+    history.forEach((p,i)=>{
+      const x = i / Math.max(1, history.length-1) * (w-8) + 4;
+      const y = h - 5 - clamp(p[key] / maxFit, 0, 1) * (h-13);
+      if(i===0) cctx.moveTo(x,y); else cctx.lineTo(x,y);
+    }); cctx.stroke();
+  }
+  plot('best','#7dd3fc'); plot('avg','#a7f3d0');
+  // mark stage transition
+  cctx.strokeStyle = 'rgba(251,191,36,.5)'; cctx.setLineDash([3,4]);
+  for(let i=1;i<history.length;i++) if(history[i-1].stage !== history[i].stage){
+    const x = i / Math.max(1, history.length-1) * (w-8) + 4;
+    cctx.beginPath(); cctx.moveTo(x,4); cctx.lineTo(x,h-4); cctx.stroke();
+  }
+  cctx.setLineDash([]);
+}
+
+function updateUI(){
+  const alive = population.filter(a=>a.alive).length;
+  const bestDistance = bestEver ? Math.max(0,bestEver.x) : 0;
+  const bestSpeed = bestEver ? Math.max(0,bestEver.avgSpeed) : 0;
+  els.generation.textContent = generation;
+  els.alive.textContent = `${alive}/${cfg.popSize}`;
+  els.bestDist.textContent = m(bestDistance);
+  els.bestSpeed.textContent = ms(bestSpeed);
+  els.diversity.textContent = stagnation.lastDiversity.toFixed(2);
+  els.escapes.textContent = stagnation.escapes;
+  els.escapeStatus.textContent = stagnation.lastAction === 'normal' ? `stale ${stagnation.stale}` : `${stagnation.lastAction} · stale ${stagnation.stale}`;
+  els.episodeClock.textContent = `${episodeTime.toFixed(1)} s / ${timeLimit().toFixed(1)} s`;
+  els.stageBadge.textContent = won ? 'Stage: run mastered' : `Stage: ${stage}`;
+  els.stageBadge.style.borderColor = stage === 'run' ? 'rgba(167,243,208,.45)' : 'rgba(125,211,252,.35)';
+  const bestGait = bestEver ? gaitStats(bestEver) : {left:0,right:0,alt:0,balance:0};
+  const walkGaitProgress = Math.min(1, Math.min(bestGait.left / 3, bestGait.right / 3, bestGait.alt / 4, bestGait.balance));
+  const runGaitProgress = Math.min(1, Math.min(bestGait.left / 4, bestGait.right / 4, bestGait.alt / 6, bestGait.balance));
+  const walkProgress = Math.min(1, Math.min(bestDistance / cfg.trackWinWalk, bestSpeed / 0.85, walkGaitProgress));
+  const runProgress = Math.min(1, Math.min(bestDistance / cfg.trackWinRun, bestSpeed / 2.45, runGaitProgress));
+  els.walkBar.style.width = `${Math.round(walkProgress*100)}%`;
+  els.runBar.style.width = `${Math.round(runProgress*100)}%`;
+  els.walkPct.textContent = `${Math.round(walkProgress*100)}%`;
+  els.runPct.textContent = `${Math.round(runProgress*100)}%`;
+  els.speedVal.textContent = `${els.speed.value}×`;
+  els.mutVal.textContent = `${Number(els.mutation.value).toFixed(1)}%`;
+  els.toggle.textContent = paused ? 'Resume' : 'Pause';
+}
+
+function loop(){
+  update();
+  drawWorld();
+  drawChart();
+  updateUI();
+  generationJustEvolved = false;
+  requestAnimationFrame(loop);
+}
+
+function reset(seedMode=false){
+  seed = (Date.now() ^ Math.floor(Math.random()*0xffffffff)) >>> 0;
+  rng = mulberry32(seed);
+  generation = 1; episodeTime = 0; stage = 'walk'; bestEver = null; history = []; cameraX = 0; won = false; stagnation = makeStagnation();
+  initPopulation(seedMode);
+}
+
+function saveChampion(){
+  if(!bestEver) return;
+  const packed = {genome:Array.from(bestEver.genome), fitness:bestEver.fitness, x:bestEver.x, avgSpeed:bestEver.avgSpeed, stage, savedAt:new Date().toISOString()};
+  localStorage.setItem('gann-stick-learner-champion-v4', JSON.stringify(packed));
+  els.save.textContent = 'Saved'; setTimeout(()=>els.save.textContent='Save champion',900);
+}
+function loadChampion(){
+  const txt = localStorage.getItem('gann-stick-learner-champion-v4') || localStorage.getItem('gann-stick-learner-champion-v3') || localStorage.getItem('gann-stick-learner-champion-v2') || localStorage.getItem('gann-stick-learner-champion-v1');
+  if(!txt){ els.load.textContent = 'No save'; setTimeout(()=>els.load.textContent='Load champion',900); return; }
+  try{
+    const packed = JSON.parse(txt);
+    if(!packed.genome || packed.genome.length < 32) throw new Error('bad genome');
+    const g = new Float32Array(genomeLength);
+    g.set(new Float32Array(packed.genome).subarray(0, Math.min(packed.genome.length, genomeLength)));
+    population = [];
+    for(let i=0;i<cfg.popSize;i++) population.push(new Agent(i===0 ? cloneGenome(g) : mutate(g, 0.08, 0.22), i));
+    bestEver = {genome:cloneGenome(g), fitness:packed.fitness||0, x:packed.x||0, avgSpeed:packed.avgSpeed||0, age:0, stage:packed.stage||stage};
+    stage = packed.stage === 'run' ? 'run' : 'walk';
+    generation = 1; episodeTime = 0; won = false; history=[]; stagnation = makeStagnation();
+    els.load.textContent = 'Loaded'; setTimeout(()=>els.load.textContent='Load champion',900);
+  }catch(e){
+    els.load.textContent = 'Bad save'; setTimeout(()=>els.load.textContent='Load champion',900);
+  }
+}
+
+els.toggle.addEventListener('click',()=>{paused=!paused;});
+els.reset.addEventListener('click',()=>reset(false));
+els.cold.addEventListener('click',()=>reset(true));
+els.forceRun.addEventListener('click',()=>{
+  stage = 'run'; won = false; episodeTime = 0; history=[]; stagnation = makeStagnation();
+  const champ = bestEver ? bestEver.genome : makeRandomGenome(0.78);
+  population=[]; for(let i=0;i<cfg.popSize;i++) population.push(new Agent(i===0 ? cloneGenome(champ) : mutate(champ, 0.16, 0.40), i));
+});
+els.save.addEventListener('click',saveChampion);
+els.load.addEventListener('click',loadChampion);
+
+canvas.addEventListener('click',(ev)=>{
+  const leader = bestThisGen || population[0];
+  if(!leader || !leader.alive) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = ev.clientX - rect.left;
+  const mid = rect.width * 0.5;
+  const shove = clamp((x - mid) / mid, -1, 1);
+  leader.vx += shove * 0.9;
+  leader.av += shove * 1.3;
+});
+window.addEventListener('keydown',(ev)=>{
+  if(ev.target && ['INPUT','SELECT','TEXTAREA'].includes(ev.target.tagName)) return;
+  if(ev.code === 'Space'){ paused=!paused; ev.preventDefault(); }
+  if(ev.key.toLowerCase() === 'r') reset(false);
+  if(ev.key.toLowerCase() === 'f') els.speed.value = els.speed.value === '40' ? '1' : '40';
+});
+
+resize();
+initPopulation(false);
+loop();
+})();
